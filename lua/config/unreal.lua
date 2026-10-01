@@ -155,16 +155,6 @@ local function log_split_win()
     return nil
 end
 
--- skipped when the menu's log float already shows the output
-local function show_log()
-    if vim.fn.bufwinid(get_log_buf()) ~= -1 then
-        return
-    end
-    local current = vim.api.nvim_get_current_win()
-    vim.cmd("botright 15split")
-    vim.api.nvim_win_set_buf(0, get_log_buf())
-    vim.api.nvim_set_current_win(current)
-end
 
 local function append_lines(lines)
     local buf = get_log_buf()
@@ -178,6 +168,8 @@ end
 
 local build = nil
 local last_build_summary = nil
+-- the status line reads this; nil after a cancel, so a cancelled build shows nothing
+local last_build_result = nil
 
 -- the menu (and later the status line) listens for this instead of being called directly
 local function notify_build_changed()
@@ -400,8 +392,8 @@ local function start_build(config, on_success)
             "-architecture=x64",
         }
 
+        -- the log shows in the menu, which opens itself on the build's first UnrealBuildChanged
         vim.api.nvim_buf_set_lines(get_log_buf(), 0, -1, false, { "> " .. table.concat(cmd, " "), "" })
-        show_log()
         set_log_title(" Building " .. config)
 
         local started = vim.uv.hrtime()
@@ -425,6 +417,7 @@ local function start_build(config, on_success)
                         set_log_title(" " .. summary)
                         vim.notify(summary, vim.log.levels.WARN)
                         last_build_summary = summary
+                        last_build_result = nil
                         notify_build_changed()
                         if this_build.restart then
                             start_build(config, on_success)
@@ -461,6 +454,7 @@ local function start_build(config, on_success)
                     set_log_title(" " .. summary)
                     vim.notify(summary, ok and vim.log.levels.INFO or vim.log.levels.ERROR)
                     last_build_summary = summary
+                    last_build_result = { ok = ok, config = config, errors = errors, finished = vim.uv.now() }
                     notify_build_changed()
 
                     if ok then
@@ -774,7 +768,7 @@ local function open_menu(state, running)
         if not item.keep_open then
             close_menu()
         elseif m.state ~= "building" then
-            -- open the log float before the build starts, so show_log finds it and skips the bottom split
+            -- switch to the build layout right away, so the log is on screen before the build's first line
             open_menu("building")
         end
         vim.cmd(item.cmd)
@@ -939,3 +933,88 @@ end
 
 vim.api.nvim_create_user_command("UnrealMenu", open_unreal_menu, { desc = "Open the Unreal build menu" })
 vim.keymap.set("n", "<leader>u", open_unreal_menu, { desc = "Unreal build menu" })
+
+-- every build shows in the menu, however it started (Rebuild, :UnrealBuild, a restart). It acts only on a
+-- build's first event, so closing the menu mid-build keeps it closed until the next build
+vim.api.nvim_create_autocmd("User", {
+    group = vim.api.nvim_create_augroup("unreal_build_menu", { clear = true }),
+    pattern = "UnrealBuildChanged",
+    callback = function()
+        if not build or build.shown then
+            return
+        end
+        build.shown = true
+        if not menu or not menu.log_win then
+            open_menu("building")
+        end
+    end,
+})
+
+-- status line: lualine calls status() about once a second. Editor detection runs from there,
+-- at most every 3s and only inside an Unreal project, instead of on a timer of its own
+
+local status_editors = {}
+local status_checked = -math.huge
+local status_checking = false
+local success_visible_ms = 10000
+
+local function refresh_status_editors()
+    if status_checking or vim.uv.now() - status_checked < 3000 then
+        return
+    end
+    status_checking = true
+    find_running_editors(function(editors)
+        status_checking = false
+        status_checked = vim.uv.now()
+        local before = status_editors[1] and status_editors[1].config
+        status_editors = editors
+        if (editors[1] and editors[1].config) ~= before then
+            vim.api.nvim_exec_autocmds("User", { pattern = "UnrealEditorChanged", modeline = false })
+        end
+    end)
+end
+
+-- returns the text (already escaped for the status line) and the highlight group to color it with.
+-- Priority: a running build, then a failed build (until the next one), then a running editor, then a recent success
+local function status_state()
+    if build then
+        if build.total then
+            local percent = math.floor(build.done / build.total * 100)
+            return string.format("Building %s %d%%%%", build.config, percent), "DiagnosticWarn"
+        end
+        return "Building " .. build.config, "DiagnosticWarn"
+    end
+    if not find_unreal_root() then
+        return "", nil
+    end
+    refresh_status_editors()
+
+    local result = last_build_result
+    if result and not result.ok then
+        local count = result.errors > 0 and string.format(" (%d)", result.errors) or ""
+        return result.config .. " build failed" .. count, "DiagnosticError"
+    end
+    if status_editors[1] then
+        return status_editors[1].config .. " editor", "DiagnosticInfo"
+    end
+    if result and vim.uv.now() - result.finished < success_visible_ms then
+        return result.config .. " build succeeded", "DiagnosticOk"
+    end
+    return "", nil
+end
+
+local function status()
+    return (status_state())
+end
+
+-- lualine wants colors, not group names, from a color function
+local function status_color()
+    local _, group = status_state()
+    local fg = group and vim.api.nvim_get_hl(0, { name = group, link = false }).fg
+    return fg and { fg = string.format("#%06x", fg) } or {}
+end
+
+return {
+    status = status,
+    status_color = status_color,
+}

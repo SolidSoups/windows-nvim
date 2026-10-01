@@ -12,6 +12,13 @@ vim.api.nvim_create_autocmd('LspProgress', {
     end
 })
 
+vim.api.nvim_create_autocmd('User', {
+    pattern = { 'UnrealBuildChanged', 'UnrealEditorChanged' },
+    callback = function()
+        require('lualine').refresh()
+    end
+})
+
 local function lsp()
     local names = {}
     for _, client in ipairs(vim.lsp.get_clients({ bufnr = 0 })) do
@@ -62,7 +69,12 @@ return {
                 lualine_a = { 'mode' },
                 lualine_b = { 'branch', 'diff', 'diagnostics' },
                 lualine_c = { 'filename' },
-                lualine_x = { { lsp, icon = '' }, 'encoding', 'filetype' },
+                lualine_x = {
+                    {
+                        function() return require('config.unreal').status() end,
+                        color = function() return require('config.unreal').status_color() end,
+                    },
+                    { lsp, icon = '' }, 'encoding', 'filetype' },
             },
             inactive_sections = {
                 lualine_a = {},

@@ -58,6 +58,56 @@ end
 -- so unlike GenerateClangDatabase it never touches the build's own flag files and doesn't force a full rebuild
 local last_db_signature
 
+-- :lsp restart only reattaches the buffers the old client had when it exited, so overlapping restarts
+-- (startup refresh, build finished) or a file opened mid-restart can leave buffers without clangd.
+-- Disabling and re-enabling the config instead attaches clangd to every loaded C++ buffer
+local clangd_restarting = false
+local clangd_restart_pending = false
+
+local function restart_clangd()
+    if clangd_restarting then
+        clangd_restart_pending = true
+        return
+    end
+    clangd_restarting = true
+    local old_clients = vim.lsp.get_clients({ name = "clangd" })
+    vim.lsp.enable("clangd", false)
+
+    -- re-enable only once Neovim has dropped the old client. is_stopped() turns true while the process is still
+    -- exiting, and re-enabling then briefly runs two clangd processes side by side. A clangd busy building its
+    -- precompiled header (common right after startup) can ignore the shutdown request for a long time, so after
+    -- the grace period it's killed rather than left running next to the new one
+    local grace_ms, kill_wait_ms = 5000, 5000
+    local started = vim.uv.now()
+    local killed = false
+    local function finish()
+        local alive = {}
+        for _, client in ipairs(old_clients) do
+            if vim.lsp.get_client_by_id(client.id) then
+                table.insert(alive, client)
+            end
+        end
+        local waited = vim.uv.now() - started
+        if #alive > 0 and waited < grace_ms + kill_wait_ms then
+            if not killed and waited >= grace_ms then
+                killed = true
+                for _, client in ipairs(alive) do
+                    client:stop(true)
+                end
+            end
+            vim.defer_fn(finish, 100)
+            return
+        end
+        vim.lsp.enable("clangd")
+        clangd_restarting = false
+        if clangd_restart_pending then
+            clangd_restart_pending = false
+            restart_clangd()
+        end
+    end
+    finish()
+end
+
 local function read_file(path)
     local file = io.open(path, "rb")
     if not file then
@@ -68,7 +118,30 @@ local function read_file(path)
     return content
 end
 
-local function regenerate_clang_db()
+-- what clangd's flags depend on: each source file and a hash of its .rsp. The generator renumbers the .rsp files
+-- between runs (GameAnalyticsEditor.4.rsp becomes .5), so comparing the raw JSON would restart clangd for nothing
+local function db_signature(database_path)
+    local content = read_file(database_path)
+    local ok, entries = pcall(vim.json.decode, content or "")
+    if not ok or type(entries) ~= "table" then
+        return nil
+    end
+    local rsp_hashes = {}
+    local parts = {}
+    for _, entry in ipairs(entries) do
+        local rsp = entry.arguments and entry.arguments[2]
+        rsp = rsp and rsp:gsub("^@", "")
+        if rsp and not rsp_hashes[rsp] then
+            rsp_hashes[rsp] = vim.fn.sha256(read_file(rsp) or "")
+        end
+        table.insert(parts, (entry.file or "") .. "|" .. (rsp and rsp_hashes[rsp] or ""))
+    end
+    table.sort(parts)
+    return table.concat(parts, "\n")
+end
+
+-- force_restart restarts clangd even when the database is unchanged, so it rereads regenerated headers
+local function regenerate_clang_db(force_restart)
     local uproject = find_uproject()
     if not uproject then
         vim.notify("No .uproject above this file", vim.log.levels.ERROR)
@@ -81,6 +154,11 @@ local function regenerate_clang_db()
         return
     end
     local name = vim.fn.fnamemodify(uproject, ":t:r")
+
+    -- first run this session: the baseline is the database clangd started with, read before it gets rewritten
+    if last_db_signature == nil then
+        last_db_signature = db_signature(root .. "/compile_commands.json")
+    end
 
     local cmd = {
         engine .. "/Engine/Binaries/DotNET/UnrealBuildTool/UnrealBuildTool.exe",
@@ -99,24 +177,15 @@ local function regenerate_clang_db()
                 return
             end
 
-            local database = read_file(root .. "/.vscode/compileCommands_" .. name .. ".json")
-            if not database then
-                vim.notify("UnrealClangDb: no compileCommands_" .. name .. ".json in .vscode", vim.log.levels.ERROR)
+            local generated = root .. "/.vscode/compileCommands_" .. name .. ".json"
+            local database = read_file(generated)
+            local signature = db_signature(generated)
+            if not database or not signature then
+                vim.notify("UnrealClangDb: no usable compileCommands_" .. name .. ".json in .vscode", vim.log.levels.ERROR)
                 return
             end
-            
-            -- the flags live in the .rsp files, so a .Build.cs change can alter them while the JSON stays the same
-            local signature = database
-            local rsp_files = vim.fn.glob(root .. "/.vscode/compileCommands_" .. name .. "/*.rsp", false, true)
-            table.sort(rsp_files)
-            for _, rsp in ipairs(rsp_files) do
-                signature = signature .. (read_file(rsp) or "")
-            end
-            if signature == last_db_signature then
-                return
-            end
-            last_db_signature = signature
 
+            -- always keep the copy current, since the .rsp names inside it change even when the flags don't
             local target = root .. "/compile_commands.json"
             if read_file(target) ~= database then
                 local file = io.open(target, "wb")
@@ -125,13 +194,20 @@ local function regenerate_clang_db()
                     file:close()
                 end
             end
-            vim.cmd("lsp restart clangd")
+
+            -- the flags live in the .rsp files, so a .Build.cs change can alter them while the file list stays the same
+            local changed = signature ~= last_db_signature
+            last_db_signature = signature
+            if changed or force_restart then
+                restart_clangd()
+            end
         end)
     end)
 end
 
--- regenerate compile_commands.json via Update-UnrealClangDb from the PowerShell profile
-vim.api.nvim_create_user_command("UnrealClangDb", regenerate_clang_db,  { desc = "Regenerate compile_commands.json for the Unreal project" })
+vim.api.nvim_create_user_command("UnrealClangDb", function()
+    regenerate_clang_db(true)
+end, { desc = "Regenerate compile_commands.json for the Unreal project" })
 
 local log_buf
 
@@ -562,6 +638,157 @@ vim.api.nvim_create_user_command("UnrealEditorStatus", function()
     end)
 end, { desc = "Show running Unreal editors" })
 
+-- after a branch switch the .generated.h files still belong to the old branch, and clangd reports errors
+-- everywhere until a build runs Unreal Header Tool. -SkipBuild runs everything before compiling, header
+-- generation included, and stops there. Same arguments as a real build, so its flag files stay identical
+local refreshing = false
+
+-- Unreal Header Tool only rewrites a .generated.h whose content changed, so the newest timestamp and the file
+-- count (a branch can remove classes) tell whether a run changed anything
+local generated_header_patterns = {
+    "/Intermediate/Build/Win64/UnrealEditor/Inc/*/UHT/*.h",
+    "/Plugins/*/Intermediate/Build/Win64/UnrealEditor/Inc/*/UHT/*.h",
+}
+
+local function generated_headers_state(root)
+    local newest, count = 0, 0
+    for _, pattern in ipairs(generated_header_patterns) do
+        for _, path in ipairs(vim.fn.glob(root .. pattern, false, true)) do
+            local stat = vim.uv.fs_stat(path)
+            if stat then
+                count = count + 1
+                newest = math.max(newest, stat.mtime.sec + stat.mtime.nsec / 1e9)
+            end
+        end
+    end
+    return newest .. ":" .. count
+end
+
+-- a refresh asked for while one is running (another save) runs once more afterwards, so no edit is missed
+local refresh_pending = false
+
+-- opts.manual: say why when skipped. opts.quiet: no "Regenerating" message (saves happen often)
+local function refresh_generated_headers(opts)
+    opts = opts or {}
+    local function skipped(reason)
+        if opts.manual then
+            vim.notify("UnrealRefresh skipped: " .. reason, vim.log.levels.WARN)
+        end
+    end
+    if refreshing then
+        refresh_pending = true
+        return
+    end
+    if build then
+        skipped("a build is running, and it regenerates the headers itself")
+        return
+    end
+    local uproject, root, engine = find_project()
+    if not uproject then
+        return
+    end
+    local target = find_editor_target(root)
+    if not target then
+        return
+    end
+
+    find_running_editors(function(editors)
+        -- an open editor blocks UnrealBuildTool (Live Coding), and the build that launched it left current headers
+        if #editors > 0 then
+            skipped("the Unreal editor is open, and Live Coding blocks UnrealBuildTool")
+            return
+        end
+        if build or refreshing then
+            return
+        end
+        refreshing = true
+        if not opts.quiet then
+            vim.notify("Regenerating Unreal headers")
+        end
+        local headers_before = generated_headers_state(root)
+        local cmd = {
+            engine .. "/Engine/Binaries/DotNET/UnrealBuildTool/UnrealBuildTool.exe",
+            target,
+            "Win64",
+            "DebugGame",
+            "-Project=" .. uproject,
+            "-WaitMutex",
+            "-FromMsBuild",
+            "-architecture=x64",
+            "-SkipBuild",
+        }
+        vim.system(cmd, { cwd = root, text = true }, function(result)
+            vim.schedule(function()
+                refreshing = false
+                if result.code ~= 0 then
+                    local output = (result.stdout or "") .. (result.stderr or "")
+                    local lines = vim.split(vim.trim(output), "\n")
+                    local tail = table.concat(vim.list_slice(lines, math.max(1, #lines - 10)), "\n")
+                    vim.notify("Regenerating Unreal headers failed:\n" .. tail, vim.log.levels.WARN)
+                else
+                    -- clangd only needs a restart when the headers it already parsed changed (a branch switch,
+                    -- a moved GENERATED_BODY); on an ordinary startup nothing changes and clangd keeps its work
+                    regenerate_clang_db(generated_headers_state(root) ~= headers_before)
+                end
+                if refresh_pending then
+                    refresh_pending = false
+                    refresh_generated_headers({ quiet = true })
+                end
+            end)
+        end)
+    end)
+end
+
+vim.api.nvim_create_user_command("UnrealRefresh", function()
+    refresh_generated_headers({ manual = true })
+end, {
+    desc = "Regenerate Unreal's generated headers and compile_commands.json without compiling",
+})
+
+local refresh_group = vim.api.nvim_create_augroup("unreal_startup", { clear = true })
+
+-- opening Neovim in the project is when stale headers from a branch switch show up
+vim.api.nvim_create_autocmd("VimEnter", {
+    group = refresh_group,
+    callback = function()
+        if find_unreal_root() then
+            refresh_generated_headers()
+        end
+    end,
+})
+
+-- GENERATED_BODY() expands to a macro named after its line, so saving a reflected header with lines added or
+-- removed above it leaves the generated header pointing at the old line. Refresh after the saves pause
+local save_timer = nil
+
+vim.api.nvim_create_autocmd("BufWritePost", {
+    group = refresh_group,
+    pattern = { "*.h", "*.hpp" },
+    callback = function(args)
+        if not find_unreal_root() then
+            return
+        end
+        local reflected = false
+        for _, line in ipairs(vim.api.nvim_buf_get_lines(args.buf, 0, -1, false)) do
+            if line:find("GENERATED_BODY", 1, true) then
+                reflected = true
+                break
+            end
+        end
+        if not reflected then
+            return
+        end
+        if save_timer then
+            save_timer:stop()
+        else
+            save_timer = vim.uv.new_timer()
+        end
+        save_timer:start(1500, 0, vim.schedule_wrap(function()
+            refresh_generated_headers({ quiet = true })
+        end))
+    end,
+})
+
 vim.api.nvim_create_user_command("UnrealEditorRelaunch", function()
     find_running_editors(function(editors)
         if #editors == 0 then
@@ -857,7 +1084,35 @@ local function open_menu(state, running)
             end)
         end,
     })
-    vim.api.nvim_create_autocmd("VimResized", { group = m.augroup, callback = close_menu })
+    -- a font size change (Ctrl+/Ctrl- in the terminal) resizes Neovim; redraw at the new size and keep the
+    -- cursor in both floats, and focus where it was
+    vim.api.nvim_create_autocmd("VimResized", {
+        group = m.augroup,
+        callback = function()
+            vim.schedule(function()
+                if menu ~= m then
+                    return
+                end
+                local menu_line = vim.api.nvim_win_get_cursor(m.menu_win)[1]
+                local log_valid = m.log_win and vim.api.nvim_win_is_valid(m.log_win)
+                local log_cursor = log_valid and vim.api.nvim_win_get_cursor(m.log_win)
+                local log_focused = log_valid and vim.api.nvim_get_current_win() == m.log_win
+
+                open_menu(m.state, m.running)
+                local new = menu
+                if not new then
+                    return
+                end
+                vim.api.nvim_win_set_cursor(new.menu_win, { math.min(menu_line, #new.items), 0 })
+                if log_cursor and new.log_win then
+                    pcall(vim.api.nvim_win_set_cursor, new.log_win, log_cursor)
+                    if log_focused then
+                        vim.api.nvim_set_current_win(new.log_win)
+                    end
+                end
+            end)
+        end,
+    })
 
     -- editors start and exit outside Neovim's view (a soft close takes a few seconds), so poll while the menu is open
     m.timer = vim.uv.new_timer()

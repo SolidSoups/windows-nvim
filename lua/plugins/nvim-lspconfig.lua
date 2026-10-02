@@ -51,6 +51,7 @@ return {
         vim.lsp.config("clangd", {
             cmd = { 
                 "clangd",
+                "--log=error",
                 "--completion-style=bundled",
                 "--limit-results=30",
                 "--offset-encoding=utf-16" ,
@@ -59,6 +60,14 @@ return {
                 "-j=8"
             },
             root_markers = { "compile_commands.json", ".clangd", ".git" },
+            capabilities = {
+                textDocument = { inactiveRegionsCapabilities = { inactiveRegions = true } },
+            },
+            handles = {
+                ["textDocument/inactiveRegions"] = function(...)
+                    require("config.cpp_regions").on_inactive_regions(...)
+                end
+            }
         })
 
         -- CSS config (Tailwind at-rules like @theme and @apply aren't standard CSS)

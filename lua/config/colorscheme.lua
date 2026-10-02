@@ -36,4 +36,7 @@ vim.api.nvim_set_hl(0, "WinSeparator", { fg = "#89b4fa", bg = "NONE" })
 -- Also highlight inactive statuslines with the same color
 vim.api.nvim_set_hl(0, "StatusLineNC", { fg = "#89b4fa", bg = "NONE" })
 
+-- Give cpp regions a color
+vim.api.nvim_set_hl(0, "@markup.heading.cpp", { fg = "#89b4fa", bold = true })
+
 vim.o.winborder = "bold"

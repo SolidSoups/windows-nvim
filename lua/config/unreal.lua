@@ -372,7 +372,8 @@ local function find_running_editors(callback)
 	)
 end
 
-local function launch_editor(config)
+-- on_launched(pid) runs once the editor process exists, for attaching the debugger from its first moment
+local function launch_editor(config, on_launched)
 	local uproject, root, engine = find_project()
 	if not uproject then
 		return
@@ -403,42 +404,84 @@ local function launch_editor(config)
 			end
 		)
 		vim.notify("Launching " .. config .. " editor")
+		if on_launched then
+			on_launched(this_editor.handle.pid)
+		end
 	end)
 end
+
+-- package.loaded checks for nvim-dap without loading it, so editor commands don't pull it in just to ask
+local function debugging()
+	local dap = package.loaded.dap
+	return dap ~= nil and dap.session() ~= nil
+end
+
+-- terminateDebuggee = false detaches and leaves the editor running. dap.terminate() would kill it
+local function detach_debugger(on_done)
+	if not debugging() then
+		if on_done then
+			on_done()
+		end
+		return
+	end
+	package.loaded.dap.disconnect({ terminateDebuggee = false }, on_done)
+end
+
+vim.api.nvim_create_user_command("UnrealDetach", function()
+	detach_debugger()
+end, { desc = "Detach the debugger and leave the Unreal editor running" })
+
+-- Windows kills a debugged process when its debugger exits, and lldb-dap exits with Neovim. Detach first,
+-- and wait for it, since Neovim won't run callbacks once VimLeavePre returns
+vim.api.nvim_create_autocmd("VimLeavePre", {
+	group = vim.api.nvim_create_augroup("unreal_debug", { clear = true }),
+	callback = function()
+		local done = false
+		detach_debugger(function()
+			done = true
+		end)
+		vim.wait(5000, function()
+			return done
+		end, 50)
+	end,
+})
 
 -- without /F, taskkill asks the editor to close, so it can prompt to save; /F kills it outright.
 -- Cancelling the save prompt leaves the editor open, so the wait gives up instead of hanging forever
 local close_timeout_ms = 90000
 
 local function close_editor(pid, force, on_closed)
-	local cmd = { "taskkill", "/PID", tostring(pid) }
-	if force then
-		table.insert(cmd, 2, "/F")
-	end
-	vim.system(cmd)
+	-- an editor paused at a breakpoint can't answer the close request, so let it run first
+	detach_debugger(function()
+		local cmd = { "taskkill", "/PID", tostring(pid) }
+		if force then
+			table.insert(cmd, 2, "/F")
+		end
+		vim.system(cmd)
 
-	local deadline = vim.uv.now() + close_timeout_ms
-	local function poll()
-		find_running_editors(function(editors)
-			for _, running in ipairs(editors) do
-				if running.pid == pid then
-					if vim.uv.now() > deadline then
-						vim.notify(
-							"The editor is still open. If you cancelled the save prompt, nothing else will happen",
-							vim.log.levels.WARN
-						)
+		local deadline = vim.uv.now() + close_timeout_ms
+		local function poll()
+			find_running_editors(function(editors)
+				for _, running in ipairs(editors) do
+					if running.pid == pid then
+						if vim.uv.now() > deadline then
+							vim.notify(
+								"The editor is still open. If you cancelled the save prompt, nothing else will happen",
+								vim.log.levels.WARN
+							)
+							return
+						end
+						vim.defer_fn(poll, 500)
 						return
 					end
-					vim.defer_fn(poll, 500)
-					return
 				end
-			end
-			if on_closed then
-				on_closed()
-			end
-		end)
-	end
-	vim.defer_fn(poll, 500)
+				if on_closed then
+					on_closed()
+				end
+			end)
+		end
+		vim.defer_fn(poll, 500)
+	end)
 end
 
 local function start_build(config, on_success)
@@ -596,6 +639,72 @@ vim.api.nvim_create_user_command("UnrealBuildRestart", function()
 	cancel_build(true)
 end, { desc = "Cancel the running Unreal build and start it again" })
 
+-- Unreal's LLDB formatters show FString, FName, TArray, TMap, ... as values instead of raw structs. The
+-- 2ByteChars variant matches Windows, where TCHAR is 2 bytes. Loading it with "command script import" runs its
+-- __lldb_init_module, which registers each formatter from Python with debugger.HandleCommand, and that call
+-- crashes lldb-dap on Windows (0xC0000409, LLVM 23.1.1). So import it as a plain Python module, which skips
+-- __lldb_init_module, and send its registration commands as ordinary LLDB commands instead. They point at
+-- lldb/unreal_formatters.py in this config, which wraps Unreal's providers (that file says why)
+local function formatter_commands(engine)
+	-- forward slashes, since Python and LLDB read a backslash inside quotes as an escape
+	local dir = engine:gsub("\\", "/") .. "/Engine/Extras/LLDBDataFormatters"
+	local wrapper_dir = vim.fn.stdpath("config"):gsub("\\", "/") .. "/lldb"
+	local file = io.open(dir .. "/UEDataFormatters_2ByteChars.py", "r")
+	if not file then
+		return {}
+	end
+	local source = file:read("*a")
+	file:close()
+	local commands = {
+		"script import sys; sys.path[0:0] = ['" .. wrapper_dir .. "', '" .. dir .. "']; import unreal_formatters",
+	}
+	-- read from the script rather than copied here, so an engine update that adds formatters is picked up
+	for _, command in source:gmatch("HandleCommand%(([\"'])(.-)%1%)") do
+		table.insert(commands, (command:gsub("UEDataFormatters_2ByteChars%.", "unreal_formatters.")))
+	end
+	-- the wrapper's own additions: enum names for TEnumAsByte, one-line vectors and rotators
+	table.insert(commands, [[type summary add -F unreal_formatters.TEnumAsByteSummaryProvider -x "^TEnumAsByte<.+>$" -w UEDataFormatters]])
+	table.insert(commands, [[type summary add -F unreal_formatters.MathSummaryProvider -e -x "^UE::Math::(TVector|TVector2|TVector4|TRotator|TQuat)<.+>$" -w UEDataFormatters]])
+	return commands
+end
+
+-- nvim-dap sends breakpoints set before this when the session starts
+local function attach_to(pid, config)
+	local _, _, engine = find_project()
+	if not engine then
+		return
+	end
+	-- a second dap.run with the same name restarts the session, and a restart can end the editor
+	if debugging() then
+		vim.notify("The debugger is already attached", vim.log.levels.WARN)
+		return
+	end
+	require("dap").run({
+		name = "Unreal editor (" .. config .. ")",
+		type = "lldb",
+		request = "attach",
+		pid = pid,
+		initCommands = formatter_commands(engine),
+	})
+end
+
+vim.api.nvim_create_user_command("UnrealAttach", function()
+	find_running_editors(function(editors)
+		if #editors == 0 then
+			vim.notify("No Unreal editor running", vim.log.levels.WARN)
+			return
+		end
+		attach_to(editors[1].pid, editors[1].config)
+	end)
+end, { desc = "Attach the debugger to the running Unreal editor" })
+
+-- for launch_editor: attaches as soon as the new editor exists, so breakpoints in startup code hit too
+local function attach_on_launch(config)
+	return function(pid)
+		attach_to(pid, config)
+	end
+end
+
 vim.api.nvim_create_user_command("UnrealEditor", function(opts)
 	launch_editor(opts.args ~= "" and opts.args or "Development")
 end, { nargs = "?", complete = complete_config, desc = "Launch the Unreal editor for this project" })
@@ -614,13 +723,15 @@ vim.api.nvim_create_user_command("UnrealEditorClose", function(opts)
 	end)
 end, { bang = true, desc = "Close the Unreal editor (! to force-close without saving)" })
 
--- named so it isn't confused with Rider's Rebuild, which cleans first
-vim.api.nvim_create_user_command("UnrealBuildRelaunch", function(opts)
+-- closes a running editor, builds, and launches it again. debug attaches the debugger to the new editor, and a
+-- rebuild started while attached stays attached
+local function build_and_launch(config_arg, debug)
+	local attach = debug or debugging()
 	find_running_editors(function(editors)
 		if #editors == 0 then
-			local config = opts.args ~= "" and opts.args or "Development"
+			local config = config_arg ~= "" and config_arg or "Development"
 			start_build(config, function()
-				launch_editor(config)
+				launch_editor(config, attach and attach_on_launch(config) or nil)
 			end)
 			return
 		end
@@ -630,15 +741,28 @@ vim.api.nvim_create_user_command("UnrealBuildRelaunch", function(opts)
 		end
 
 		-- rebuild the configuration the editor was running, unless one was given
-		local config = opts.args ~= "" and opts.args or editors[1].config
+		local config = config_arg ~= "" and config_arg or editors[1].config
 		vim.notify("Closing the editor to build " .. config)
 		close_editor(editors[1].pid, false, function()
 			start_build(config, function()
-				launch_editor(config)
+				launch_editor(config, attach and attach_on_launch(config) or nil)
 			end)
 		end)
 	end)
+end
+
+-- named so it isn't confused with Rider's Rebuild, which cleans first
+vim.api.nvim_create_user_command("UnrealBuildRelaunch", function(opts)
+	build_and_launch(opts.args, false)
 end, { nargs = "?", complete = complete_config, desc = "Close the Unreal editor, build, and relaunch it" })
+
+vim.api.nvim_create_user_command("UnrealBuildDebug", function(opts)
+	build_and_launch(opts.args, true)
+end, {
+	nargs = "?",
+	complete = complete_config,
+	desc = "Build, launch the Unreal editor, and attach the debugger (closes a running editor first)",
+})
 
 vim.api.nvim_create_user_command("UnrealEditorStatus", function()
 	find_running_editors(function(editors)
@@ -660,27 +784,6 @@ end, { desc = "Show running Unreal editors" })
 -- everywhere until a build runs Unreal Header Tool. -SkipBuild runs everything before compiling, header
 -- generation included, and stops there. Same arguments as a real build, so its flag files stay identical
 local refreshing = false
-
--- Unreal Header Tool only rewrites a .generated.h whose content changed, so the newest timestamp and the file
--- count (a branch can remove classes) tell whether a run changed anything
-local generated_header_patterns = {
-	"/Intermediate/Build/Win64/UnrealEditor/Inc/*/UHT/*.h",
-	"/Plugins/*/Intermediate/Build/Win64/UnrealEditor/Inc/*/UHT/*.h",
-}
-
-local function generated_headers_state(root)
-	local newest, count = 0, 0
-	for _, pattern in ipairs(generated_header_patterns) do
-		for _, path in ipairs(vim.fn.glob(root .. pattern, false, true)) do
-			local stat = vim.uv.fs_stat(path)
-			if stat then
-				count = count + 1
-				newest = math.max(newest, stat.mtime.sec + stat.mtime.nsec / 1e9)
-			end
-		end
-	end
-	return newest .. ":" .. count
-end
 
 -- a refresh asked for while one is running (another save) runs once more afterwards, so no edit is missed
 local refresh_pending = false
@@ -710,15 +813,13 @@ local function refresh_generated_headers(opts)
 		return
 	end
 
-	find_running_editors(function(editors)
+	find_running_editors(function()
 		if build or refreshing then
 			return
 		end
-		refreshing = true
 		if not opts.quiet then
 			vim.notify("Regenerating Unreal headers")
 		end
-		local headers_before = generated_headers_state(root)
 		local cmd = {
 			engine .. "/Engine/Binaries/DotNET/UnrealBuildTool/UnrealBuildTool.exe",
 			target,
@@ -730,7 +831,9 @@ local function refresh_generated_headers(opts)
 			"-architecture=x64",
 			"-SkipBuild",
 		}
-		vim.system(cmd, { cwd = root, text = true }, function(result)
+		-- the flag goes on only once the process is running. An error or Ctrl-C before that would leave it
+		-- on, and every later refresh would queue behind a run that never finishes
+		local ok, err = pcall(vim.system, cmd, { cwd = root, text = true }, function(result)
 			vim.schedule(function()
 				refreshing = false
 				if result.code ~= 0 then
@@ -743,12 +846,10 @@ local function refresh_generated_headers(opts)
 					-- A didSave instead makes clangd recheck every open file's includes, which picks up the new
 					-- .generated.h; the save that triggered this refresh went out before the header tool ran
 					regenerate_clang_db(false)
-					if generated_headers_state(root) ~= headers_before then
-						for _, client in ipairs(vim.lsp.get_clients({ name = "clangd" })) do
-							local buf = next(client.attached_buffers)
-							if buf then
-								client:notify("textDocument/didSave", { textDocument = { uri = vim.uri_from_bufnr(buf) } })
-							end
+					for _, client in ipairs(vim.lsp.get_clients({ name = "clangd" })) do
+						local buf = next(client.attached_buffers)
+						if buf then
+							client:notify("textDocument/didSave", { textDocument = { uri = vim.uri_from_bufnr(buf) } })
 						end
 					end
 				end
@@ -758,6 +859,11 @@ local function refresh_generated_headers(opts)
 				end
 			end)
 		end)
+		if ok then
+			refreshing = true
+		else
+			vim.notify("Regenerating Unreal headers failed: " .. tostring(err), vim.log.levels.WARN)
+		end
 	end)
 end
 
@@ -826,8 +932,10 @@ vim.api.nvim_create_user_command("UnrealEditorRelaunch", function()
 			return
 		end
 		local running = editors[1]
+		-- close_editor detaches, so ask now whether to attach to the new editor
+		local attach = debugging()
 		close_editor(running.pid, false, function()
-			launch_editor(running.config)
+			launch_editor(running.config, attach and attach_on_launch(running.config) or nil)
 		end)
 	end)
 end, { desc = "Close the Unreal editor and launch it again without building" })
@@ -880,14 +988,19 @@ local function menu_items(state, running)
 		}
 	elseif state == "editor" then
 		items = {
+			debugging() and { label = "Detach Debugger", cmd = "UnrealDetach" }
+				or { label = "Attach Debugger", cmd = "UnrealAttach" },
+			-- Rebuild and Relaunch reattach when the debugger was attached
 			{ label = "Rebuild " .. running.config, cmd = "UnrealBuildRelaunch" },
 			{ label = "Close Editor", cmd = "UnrealEditorClose" },
 			{ label = "Relaunch Editor", cmd = "UnrealEditorRelaunch" },
 			{ label = "Force Close Editor", cmd = "UnrealEditorClose!" },
 		}
 	else
-		-- builds before plain launches, and DebugGame first in each group: it's the configuration in daily use
+		-- debugging first, then builds before plain launches, DebugGame first in each group: it's the configuration
+		-- in daily use
 		items = {
+			{ label = "Build and Debug DebugGame", cmd = "UnrealBuildDebug DebugGame", keep_open = true },
 			{ label = "Build and Run DebugGame", cmd = "UnrealBuildRelaunch DebugGame", keep_open = true },
 			{ label = "Build DebugGame", cmd = "UnrealBuild DebugGame", keep_open = true },
 			{ label = "Build and Run Development", cmd = "UnrealBuildRelaunch Development", keep_open = true },

@@ -988,20 +988,19 @@ local function menu_items(state, running)
 		}
 	elseif state == "editor" then
 		items = {
-			debugging() and { label = "Detach Debugger", cmd = "UnrealDetach" }
-				or { label = "Attach Debugger", cmd = "UnrealAttach" },
 			-- Rebuild and Relaunch reattach when the debugger was attached
 			{ label = "Rebuild " .. running.config, cmd = "UnrealBuildRelaunch" },
 			{ label = "Close Editor", cmd = "UnrealEditorClose" },
 			{ label = "Relaunch Editor", cmd = "UnrealEditorRelaunch" },
+			debugging() and { label = "Detach Debugger", cmd = "UnrealDetach" }
+				or { label = "Attach Debugger", cmd = "UnrealAttach" },
 			{ label = "Force Close Editor", cmd = "UnrealEditorClose!" },
 		}
 	else
-		-- debugging first, then builds before plain launches, DebugGame first in each group: it's the configuration
-		-- in daily use
+		-- builds before plain launches, and DebugGame first in each group: it's the configuration in daily use
 		items = {
-			{ label = "Build and Debug DebugGame", cmd = "UnrealBuildDebug DebugGame", keep_open = true },
 			{ label = "Build and Run DebugGame", cmd = "UnrealBuildRelaunch DebugGame", keep_open = true },
+			{ label = "Build and Debug DebugGame", cmd = "UnrealBuildDebug DebugGame", keep_open = true },
 			{ label = "Build DebugGame", cmd = "UnrealBuild DebugGame", keep_open = true },
 			{ label = "Build and Run Development", cmd = "UnrealBuildRelaunch Development", keep_open = true },
 			{ label = "Build Development", cmd = "UnrealBuild Development", keep_open = true },

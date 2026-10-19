@@ -788,6 +788,40 @@ local refreshing = false
 -- a refresh asked for while one is running (another save) runs once more afterwards, so no edit is missed
 local refresh_pending = false
 
+-- header tool errors get their own namespace, so setting them never replaces clangd's diagnostics
+local uht_ns = vim.api.nvim_create_namespace("unreal_header_tool")
+
+-- turns "C:\...\MCO_Door.h(20): Error: msg" lines into diagnostics on the open buffer for that file.
+-- Returns false when nothing matched an open buffer, so the caller can still say something
+local function set_uht_diagnostics(output)
+	vim.diagnostic.reset(uht_ns)
+	local by_path = {}
+	for line in output:gmatch("[^\r\n]+") do
+		local path, lnum, msg = line:match("^%s*(.-)%((%d+)%): Error: (.*)$")
+		if path then
+			-- vim.fn.bufnr() takes a file pattern, which backslashes and spaces in the path break
+			local key = vim.fs.normalize(path):lower()
+			by_path[key] = by_path[key] or {}
+			table.insert(by_path[key], {
+				lnum = tonumber(lnum) - 1,
+				col = 0,
+				message = msg,
+				severity = vim.diagnostic.severity.ERROR,
+				source = "UHT",
+			})
+		end
+	end
+	local found = false
+	for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+		local diags = by_path[vim.fs.normalize(vim.api.nvim_buf_get_name(buf)):lower()]
+		if diags then
+			vim.diagnostic.set(uht_ns, buf, diags)
+			found = true
+		end
+	end
+	return found
+end
+
 -- opts.manual: say why when skipped. opts.quiet: no "Regenerating" message (saves happen often)
 local function refresh_generated_headers(opts)
 	opts = opts or {}
@@ -838,10 +872,18 @@ local function refresh_generated_headers(opts)
 				refreshing = false
 				if result.code ~= 0 then
 					local output = (result.stdout or "") .. (result.stderr or "")
-					local lines = vim.split(vim.trim(output), "\n")
-					local tail = table.concat(vim.list_slice(lines, math.max(1, #lines - 10)), "\n")
-					vim.notify("Regenerating Unreal headers failed:\n" .. tail, vim.log.levels.WARN)
+					local shown = set_uht_diagnostics(output)
+					-- a multi-line message stops the editor at a "Press ENTER" prompt, so only :UnrealRefresh
+					-- gets the full output. Saves rely on the diagnostics, or one line when nothing could be placed
+					if opts.manual then
+						local lines = vim.split(vim.trim(output), "\n")
+						local tail = table.concat(vim.list_slice(lines, math.max(1, #lines - 10)), "\n")
+						vim.notify("Regenerating Unreal headers failed:\n" .. tail, vim.log.levels.WARN)
+					elseif not shown then
+						vim.notify("Unreal header refresh failed (:UnrealRefresh for details)", vim.log.levels.WARN)
+					end
 				else
+					vim.diagnostic.reset(uht_ns)
 					-- restarting clangd throws away its precompiled header, and one busy rebuilding it gets killed.
 					-- A didSave instead makes clangd recheck every open file's includes, which picks up the new
 					-- .generated.h; the save that triggered this refresh went out before the header tool ran

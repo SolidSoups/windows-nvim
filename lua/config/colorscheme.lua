@@ -29,7 +29,7 @@ vim.api.nvim_create_autocmd("ColorScheme", {
     end
 })
 
-vim.cmd("colorscheme melange")
+vim.cmd("colorscheme catppuccin")
 
 -- Make split seperators more visible with transparency
 vim.api.nvim_set_hl(0, "WinSeparator", { fg = "#89b4fa", bg = "NONE" })

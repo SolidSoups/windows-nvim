@@ -57,6 +57,9 @@ return {
                     vim.bo.indentexpr = "v:lua.require'config.svelte-indent'.indentexpr()"
                     -- re-indent when > is typed, so closing tags snap into place
                     vim.cmd("setlocal indentkeys+=<>>")
+                elseif cpp then
+                    -- treesitter indents one level too deep below Unreal macros, see config/cpp-indent.lua
+                    vim.bo.indentexpr = "v:lua.require'config.cpp-indent'.indentexpr()"
                 elseif args.match ~= "rust" then
                     vim.bo.indentexpr = "v:lua.require'nvim-treesitter'.indentexpr()"
                 end

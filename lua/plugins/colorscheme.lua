@@ -23,4 +23,7 @@ return {
 	{
 		"savq/melange-nvim",
 	},
+    {
+        "tpope/vim-vividchalk"
+    }
 }

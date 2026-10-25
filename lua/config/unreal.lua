@@ -663,8 +663,14 @@ local function formatter_commands(engine)
 		table.insert(commands, (command:gsub("UEDataFormatters_2ByteChars%.", "unreal_formatters.")))
 	end
 	-- the wrapper's own additions: enum names for TEnumAsByte, one-line vectors and rotators
-	table.insert(commands, [[type summary add -F unreal_formatters.TEnumAsByteSummaryProvider -x "^TEnumAsByte<.+>$" -w UEDataFormatters]])
-	table.insert(commands, [[type summary add -F unreal_formatters.MathSummaryProvider -e -x "^UE::Math::(TVector|TVector2|TVector4|TRotator|TQuat)<.+>$" -w UEDataFormatters]])
+	table.insert(
+		commands,
+		[[type summary add -F unreal_formatters.TEnumAsByteSummaryProvider -x "^TEnumAsByte<.+>$" -w UEDataFormatters]]
+	)
+	table.insert(
+		commands,
+		[[type summary add -F unreal_formatters.MathSummaryProvider -e -x "^UE::Math::(TVector|TVector2|TVector4|TRotator|TQuat)<.+>$" -w UEDataFormatters]]
+	)
 	return commands
 end
 
@@ -1408,12 +1414,13 @@ local class_kinds = {
 
 public:
 	{CLASS}();
+	virtual void Tick(float DeltaTime) override;
 
 protected:
 	virtual void BeginPlay() override;
 
-public:
-	virtual void Tick(float DeltaTime) override;
+private:
+    // put some private shit here!
 ]],
 		source = [[
 
@@ -1440,12 +1447,13 @@ void {CLASS}::Tick(float DeltaTime)
 
 public:
 	{CLASS}();
+	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
 protected:
 	virtual void BeginPlay() override;
 
-public:
-	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
+private:
+    // put some private shit here!
 ]],
 		source = [[
 

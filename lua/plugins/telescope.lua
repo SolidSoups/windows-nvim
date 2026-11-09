@@ -42,7 +42,7 @@ return {
 				},
 			},
 		})
-        opts.picker = {
+        opts.pickers = {
             find_files = {
                 find_command = vim.list_extend({
                     "rg",

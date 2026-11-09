@@ -117,6 +117,42 @@ local function read_file(path)
 	return content
 end
 
+-- Unreal's generated flags leave out the C++ version and the conforming preprocessor, which clangd needs
+local CLANGD_CONFIG = [[
+CompileFlags:
+  Add: [/std:c++20, /U_MSVC_TRADITIONAL]
+
+Diagnostics:
+  UnusedIncludes: None
+  Suppress: [attribute_dll_deleted]
+]]
+
+-- writes .clangd if the project has none, and keeps it out of git on every branch
+local function ensure_clangd_config(root)
+	local path = root .. "/.clangd"
+	if vim.uv.fs_stat(path) then
+		return false
+	end
+	local file = io.open(path, "wb")
+	if not file then
+		return false
+	end
+	file:write(CLANGD_CONFIG)
+	file:close()
+
+	-- .git is a file in a worktree, so this only runs for a normal checkout
+	local exclude = root .. "/.git/info/exclude"
+	local current = read_file(exclude)
+	if current and not vim.tbl_contains(vim.split(current, "\r?\n"), ".clangd") then
+		local out = io.open(exclude, "ab")
+		if out then
+			out:write((current == "" or current:sub(-1) == "\n") and ".clangd\n" or "\n.clangd\n")
+			out:close()
+		end
+	end
+	return true
+end
+
 -- what clangd's flags depend on: each source file and a hash of its .rsp. The generator renumbers the .rsp files
 -- between runs (GameAnalyticsEditor.4.rsp becomes .5), so comparing the raw JSON would restart clangd for nothing
 local function db_signature(database_path)
@@ -199,10 +235,12 @@ local function regenerate_clang_db(force_restart)
 				end
 			end
 
+			local wrote_config = ensure_clangd_config(root)
+
 			-- the flags live in the .rsp files, so a .Build.cs change can alter them while the file list stays the same
 			local changed = signature ~= last_db_signature
 			last_db_signature = signature
-			if changed or force_restart then
+			if changed or force_restart or wrote_config then
 				restart_clangd()
 			end
 		end)
@@ -1507,9 +1545,19 @@ void {CLASS}::Deinitialize()
 }
 ]],
 	},
+	settings = {
+		-- DefaultConfig writes to DefaultGame.ini instead of the per-user Saved config, so the values get checked in
+		specifiers = "Config=Game, DefaultConfig",
+		header = [[
+
+public:
+	static const {CLASS}* Get() { return GetDefault<{CLASS}>(); }
+]],
+	},
 }
 
--- parents without a kind get an empty class body. UUserWidget needs "UMG" in the module's .Build.cs to link
+-- parents without a kind get an empty class body. UUserWidget needs "UMG" in the module's .Build.cs to link,
+-- UDeveloperSettings needs "DeveloperSettings"
 local class_parents = {
 	{ name = "AActor", include = "GameFramework/Actor.h", kind = "actor" },
 	{ name = "UActorComponent", include = "Components/ActorComponent.h", kind = "component" },
@@ -1521,6 +1569,7 @@ local class_parents = {
 	{ name = "APlayerController", include = "GameFramework/PlayerController.h" },
 	{ name = "UUserWidget", include = "Blueprint/UserWidget.h", kind = "widget" },
 	{ name = "UWorldSubsystem", include = "Subsystems/WorldSubsystem.h", kind = "subsystem" },
+	{ name = "UDeveloperSettings", include = "Engine/DeveloperSettings.h", kind = "settings" },
 }
 
 -- Unreal Header Tool rejects a header whose .generated.h isn't the last include
@@ -1585,7 +1634,7 @@ local function write_class(dir, module, parent, name)
 	refresh_generated_headers({ manual = true })
 end
 
-local parent_keys = "1234567890"
+local parent_keys = "1234567890-"
 
 -- same look as the build menu: a numbered float, picked with the number, or j/k and <CR>
 local function pick_parent(on_pick)

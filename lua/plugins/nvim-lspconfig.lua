@@ -56,7 +56,8 @@ return {
                 "--limit-results=30",
                 "--offset-encoding=utf-16" ,
                 "--background-index",
-                "--header-insertion=never",
+                "--header-insertion=iwyu",
+                "--header-insertion-decorators",
                 "-j=8"
             },
             root_markers = { "compile_commands.json", ".clangd", ".git" },

@@ -38,3 +38,15 @@ vim.api.nvim_create_autocmd("LspAttach", {
 vim.keymap.set("n", "<leader>nc", function()
     vim.cmd.edit(vim.fn.stdpath("config"))
 end, { desc = "Open Neovim config directory" })
+
+-- insert Unreal copyright notice at top of file
+vim.keymap.set("n", "<leader>ic", function()
+	local notice = "// Copyright (c) "
+		.. os.date("%Y")
+		.. " Bitfire Games. All rights reserved. Unauthorized copying, modification, distribution, or use of this file or any part thereof, without express written permission from Bitfire Games, is strictly prohibited. DarkSwarm is a trademark of Bitfire Games ApS."
+	local first = vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] or ""
+	if first:match("^// Copyright %(c%) %d+ Bitfire Games") then
+		return
+	end
+	vim.api.nvim_buf_set_lines(0, 0, 0, false, { notice, "" })
+end, { desc = "Insert copyright notice" })

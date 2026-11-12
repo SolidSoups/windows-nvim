@@ -26,6 +26,8 @@ vim.api.nvim_create_autocmd("ColorScheme", {
         vim.api.nvim_set_hl(0, "WinSeparator", { fg = "#89b4fa", bg = "NONE" })
         -- Also highlight inactive statuslines with the same color
         vim.api.nvim_set_hl(0, "StatusLineNC", { fg = "#89b4fa", bg = "NONE" })
+        -- dim indent guides
+        vim.api.nvim_set_hl(0, "IblIndent", { fg = "#45475a" })
     end
 })
 
